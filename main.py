@@ -1,5 +1,6 @@
 # app구현
 
+import csv
 import json
 import os
 import re
@@ -46,6 +47,17 @@ templates = Jinja2Templates(
 )
 
 HEAT_DATA_FILE = BASE_DIR / "data" / "processed" / "heat_vulnerability.json"
+
+# tg 추가 / 행정동별 녹지율 원본 CSV
+HEAT_INDICATORS_FILE = (
+    BASE_DIR / "data" / "processed" / "heat_indicators.csv"
+)
+
+# tg 추가 / 행정동별 건물밀도 원본 CSV
+BUILDING_DENSITY_FILE = (
+    BASE_DIR / "data" / "processed" / "building_density_by_dong.csv"
+)
+
 NAVER_LOCAL_SEARCH_URL = "https://naverapihub.apigw.ntruss.com/search/v1/local"
 
 # jisu_03_추가 -> 행정동 경계 및 실시간 기상 데이터 설정-------------#
@@ -66,6 +78,12 @@ KMA_CURRENT_WEATHER_API_URL = (
     "https://apis.data.go.kr/1360000/"
     # 초단기실황 getUltraSrtNcst / 초단기예보 getUltraSrtFcst
     "VilageFcstInfoService_2.0/getUltraSrtNcst"
+)
+
+# tg 수정 / 현재 시각 이후 12시간 기온 예보를 조회하는 단기예보 API
+KMA_VILLAGE_FORECAST_API_URL = (
+    "https://apis.data.go.kr/1360000/"
+    "VilageFcstInfoService_2.0/getVilageFcst"
 )
 
 KMA_ALERT_CACHE: dict[str, Any] = {"expires_at": 0.0, "items": []}
@@ -106,7 +124,138 @@ def load_heat_payload() -> dict[str, Any]:
             detail="폭염 취약도 데이터 형식이 올바르지 않습니다.",
         )
 
+    # tg 수정 / 내부 조회 함수에서도 녹지율과 건물밀도가 포함된 레코드를 사용한다.
+    payload = dict(payload)
+    payload["records"] = add_environment_metrics_to_records(
+        payload["records"]
+    )
+
     return payload
+
+
+@lru_cache(maxsize=1)
+def load_green_ratio_by_region() -> dict[str, float]:
+    """heat_indicators.csv의 행정동별 green_ratio_pct를 읽는다."""
+    if not HEAT_INDICATORS_FILE.exists():
+        return {}
+
+    green_ratio_by_region: dict[str, float] = {}
+
+    try:
+        with HEAT_INDICATORS_FILE.open(
+            "r",
+            encoding="utf-8-sig",
+            newline="",
+        ) as csv_file:
+            reader = csv.DictReader(csv_file)
+
+            for row in reader:
+                region_code = str(
+                    row.get("adm_cd")
+                    or row.get("ADM_CD")
+                    or row.get("region_code")
+                    or row.get("dong_code")
+                    or ""
+                ).strip()
+
+                green_ratio_value = row.get("green_ratio_pct")
+
+                if not region_code or green_ratio_value in (None, ""):
+                    continue
+
+                try:
+                    green_ratio = float(green_ratio_value)
+                except (TypeError, ValueError):
+                    continue
+
+                green_ratio_by_region[region_code] = green_ratio
+    except OSError:
+        return {}
+
+    return green_ratio_by_region
+
+
+def add_green_ratio_to_records(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """폭염 취약도 레코드에 green_ratio_pct를 병합한다."""
+    green_ratio_by_region = load_green_ratio_by_region()
+    enriched_records: list[dict[str, Any]] = []
+
+    for record in records:
+        enriched_record = dict(record)
+        region_code = str(record.get("adm_cd", "")).strip()
+
+        # tg 추가 / 동일 행정동 코드의 녹지율을 API 응답에 포함한다.
+        enriched_record["green_ratio_pct"] = green_ratio_by_region.get(
+            region_code
+        )
+        enriched_records.append(enriched_record)
+
+    return enriched_records
+
+
+@lru_cache(maxsize=1)
+def load_building_density_by_region() -> dict[str, float]:
+    """building_density_by_dong.csv의 행정동별 건물밀도를 읽는다."""
+    if not BUILDING_DENSITY_FILE.exists():
+        return {}
+
+    building_density_by_region: dict[str, float] = {}
+
+    try:
+        with BUILDING_DENSITY_FILE.open(
+            "r",
+            encoding="utf-8-sig",
+            newline="",
+        ) as csv_file:
+            reader = csv.DictReader(csv_file)
+
+            for row in reader:
+                region_code = str(row.get("adm_cd") or "").strip()
+                density_value = row.get("building_density_pct")
+
+                if not region_code or density_value in (None, ""):
+                    continue
+
+                try:
+                    building_density = float(density_value)
+                except (TypeError, ValueError):
+                    continue
+
+                building_density_by_region[region_code] = building_density
+    except OSError:
+        return {}
+
+    return building_density_by_region
+
+
+def add_building_density_to_records(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """폭염 취약도 레코드에 building_density_pct를 병합한다."""
+    building_density_by_region = load_building_density_by_region()
+    enriched_records: list[dict[str, Any]] = []
+
+    for record in records:
+        enriched_record = dict(record)
+        region_code = str(record.get("adm_cd", "")).strip()
+
+        # tg 추가 / 동일 행정동 코드의 건물밀도를 API 응답에 포함한다.
+        enriched_record["building_density_pct"] = (
+            building_density_by_region.get(region_code)
+        )
+        enriched_records.append(enriched_record)
+
+    return enriched_records
+
+
+def add_environment_metrics_to_records(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """녹지율과 건물밀도를 행정동 레코드에 함께 병합한다."""
+    records_with_green_ratio = add_green_ratio_to_records(records)
+    return add_building_density_to_records(records_with_green_ratio)
 
 
 @lru_cache(maxsize=1)
@@ -412,6 +561,146 @@ def fetch_kma_observation(
     }
 
 
+# tg 추가 / 단기예보 발표시각 중 현재 조회 가능한 가장 최신 기준시각을 계산한다.
+def current_kma_forecast_base_datetime(now: datetime | None = None) -> datetime:
+    """
+    단기예보 발표시각(02, 05, 08, 11, 14, 17, 20, 23시) 중
+    현재 조회 가능한 가장 최신 시각을 반환한다.
+
+    API 반영 지연을 고려해 현재 시각에서 10분을 뺀 뒤 기준시각을 선택한다.
+    """
+    current_time = now or datetime.now(KOREA_TIMEZONE)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=KOREA_TIMEZONE)
+
+    available_time = current_time - timedelta(minutes=10)
+    forecast_hours = (2, 5, 8, 11, 14, 17, 20, 23)
+
+    for hour in reversed(forecast_hours):
+        candidate = available_time.replace(
+            hour=hour,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        if candidate <= available_time:
+            return candidate
+
+    previous_day = available_time - timedelta(days=1)
+    return previous_day.replace(
+        hour=23,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+
+# tg 수정 / 기상청 단기예보에서 현재 시각 이후 12개 시간별 기온을 조회한다.
+def fetch_kma_12hour_forecast(
+    nx: int,
+    ny: int,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """
+    getVilageFcst의 TMP 예보를 현재 시각 이후 첫 정시부터 12시간까지 반환한다.
+
+    그래프에서 기존 hourlyTemperatures 필드를 그대로 사용할 수 있도록
+    observedAt과 temperature 키를 유지한다.
+    """
+    service_key = os.getenv("KMA_SERVICE_KEY", "").strip()
+    if not service_key:
+        raise RuntimeError("KMA_SERVICE_KEY가 설정되지 않았습니다.")
+
+    current_time = now or datetime.now(KOREA_TIMEZONE)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=KOREA_TIMEZONE)
+
+    base_datetime = current_kma_forecast_base_datetime(current_time)
+    query = urlencode(
+        {
+            "ServiceKey": service_key,
+            "pageNo": 1,
+            "numOfRows": 1000,
+            "dataType": "JSON",
+            "base_date": base_datetime.strftime("%Y%m%d"),
+            "base_time": base_datetime.strftime("%H00"),
+            "nx": nx,
+            "ny": ny,
+        }
+    )
+
+    with urlopen(f"{KMA_VILLAGE_FORECAST_API_URL}?{query}", timeout=10) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    response_payload = payload.get("response", {}) if isinstance(payload, dict) else {}
+    if not isinstance(response_payload, dict):
+        raise ValueError("기상청 단기예보 응답 형식이 올바르지 않습니다.")
+
+    header = response_payload.get("header", {})
+    if str(header.get("resultCode", "")) not in {"00", "0"}:
+        raise ValueError(
+            f"기상청 단기예보 API 오류: "
+            f"{header.get('resultMsg', '응답을 확인할 수 없습니다.')}"
+        )
+
+    body = response_payload.get("body", {})
+    items_container = body.get("items", {}) if isinstance(body, dict) else {}
+    items = items_container.get("item", []) if isinstance(items_container, dict) else []
+
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list) or not items:
+        raise ValueError("기상청 단기예보 항목이 없습니다.")
+
+    # 현재 시간이 정확히 정시인 경우에도 '현재 이후'가 되도록 다음 정시부터 시작한다.
+    first_forecast_time = current_time.replace(
+        minute=0,
+        second=0,
+        microsecond=0,
+    ) + timedelta(hours=1)
+    forecast_end_time = first_forecast_time + timedelta(hours=12)
+
+    temperature_by_time: dict[datetime, float] = {}
+
+    for item in items:
+        if not isinstance(item, dict) or str(item.get("category", "")) != "TMP":
+            continue
+
+        forecast_date = str(item.get("fcstDate", ""))
+        forecast_time = str(item.get("fcstTime", "")).zfill(4)
+
+        try:
+            forecast_datetime = datetime.strptime(
+                f"{forecast_date}{forecast_time}",
+                "%Y%m%d%H%M",
+            ).replace(tzinfo=KOREA_TIMEZONE)
+            temperature = float(item.get("fcstValue"))
+        except (TypeError, ValueError):
+            continue
+
+        if (
+            not math.isfinite(temperature)
+            or forecast_datetime < first_forecast_time
+            or forecast_datetime >= forecast_end_time
+        ):
+            continue
+
+        temperature_by_time[forecast_datetime] = temperature
+
+    forecasts = [
+        {
+            "observedAt": forecast_datetime.isoformat(timespec="minutes"),
+            "temperature": temperature,
+        }
+        for forecast_datetime, temperature in sorted(temperature_by_time.items())
+    ]
+
+    if not forecasts:
+        raise ValueError("현재 시각 이후의 단기 기온예보가 없습니다.")
+
+    return forecasts[:12]
+
+
 def save_weather_observation(observation: dict[str, Any]) -> None:
     """한 격자의 정시 실황을 중복 없이 SQLite에 저장하거나 갱신한다."""
     initialize_weather_database()
@@ -484,6 +773,47 @@ def get_weather_observation(
     finally:
         connection.close()
     return dict(row) if row is not None else None
+
+# tg 추가 / 선택 행정동의 온도 변화 그래프에 사용할 최근 시간별 실황을 조회한다.
+def get_weather_history(
+    nx: int,
+    ny: int,
+    limit: int = 6,
+) -> list[dict[str, Any]]:
+    """
+    선택한 기상청 격자의 최근 시간별 실황을 조회한다.
+
+    DB에서는 최신순으로 가져오지만, 그래프는 왼쪽에서 오른쪽으로
+    시간이 흐르도록 오래된 자료부터 최신 자료 순서로 반환한다.
+    """
+    initialize_weather_database()
+
+    # tg 추가 / 비정상적으로 큰 조회 요청이 들어오지 않도록 범위를 제한한다.
+    safe_limit = max(1, min(limit, 24))
+
+    with closing(sqlite3.connect(WEATHER_DB_FILE, timeout=10)) as connection:
+        connection.row_factory = sqlite3.Row
+
+        rows = connection.execute(
+            """
+            SELECT
+                observed_at,
+                temperature,
+                humidity,
+                apparent_temperature,
+                precipitation_type
+            FROM weather_observations
+            WHERE nx = ?
+              AND ny = ?
+              AND temperature IS NOT NULL
+            ORDER BY observed_at DESC
+            LIMIT ?
+            """,
+            (nx, ny, safe_limit),
+        ).fetchall()
+
+    # tg 추가 / SQL 결과는 최신순이므로 그래프용으로 시간 오름차순으로 뒤집는다.
+    return [dict(row) for row in reversed(rows)]
 
 
 @lru_cache(maxsize=1)
@@ -793,6 +1123,9 @@ def heat_vulnerability():
             },
         )
 
+    # tg 수정 / 프런트엔드가 녹지율과 건물밀도 카드를 채울 수 있도록 CSV 값을 병합한다.
+    records = add_environment_metrics_to_records(records)
+
     return {
         "status": "ready",
         "base_date": payload.get("base_date"),
@@ -906,6 +1239,7 @@ def region_weather(region_code: str):
     target_datetime = current_kma_base_datetime()
     observation = get_weather_observation(nx, ny, target_datetime)
     collection_failed = False
+    forecast_failed = False
 
     # 자동 수집 전 처음 선택된 격자는 한 번 즉시 저장한 뒤 DB 값으로 응답한다.
     if observation is None and os.getenv("KMA_SERVICE_KEY", "").strip():
@@ -935,12 +1269,30 @@ def region_weather(region_code: str):
             "regionCode": region_code,
             "regionName": f"{record.get('district')} {record.get('dong')}",
             "source": "기상청 초단기실황 · 시간별 DB",
+            # tg 추가 / 조회 실패 시에도 프론트엔드가 배열로 처리할 수 있게 한다.
+            "hourlyTemperatures": [],
             "message": (
                 "기상청 API 인증 또는 실황 응답을 확인할 수 없습니다."
                 if configured or collection_failed
                 else "KMA_SERVICE_KEY가 설정되지 않아 실시간 날씨를 수집할 수 없습니다."
             ),
         }
+
+    # tg 수정 / 과거 DB 실황 대신 현재 시각 이후 12시간 단기 기온예보를 조회한다.
+    try:
+        hourly_temperatures = fetch_kma_12hour_forecast(nx, ny)
+    except (
+        HTTPError,
+        URLError,
+        TimeoutError,
+        UnicodeError,
+        json.JSONDecodeError,
+        OSError,
+        ValueError,
+        RuntimeError,
+    ):
+        forecast_failed = True
+        hourly_temperatures = []
 
     precipitation_type = int(observation.get("precipitation_type") or 0)
     condition_by_precipitation = {
@@ -958,7 +1310,7 @@ def region_weather(region_code: str):
         "status": "ready",
         "regionCode": region_code,
         "regionName": f"{record.get('district')} {record.get('dong')}",
-        "source": "기상청 초단기실황 · 시간별 DB",
+        "source": "기상청 초단기실황 · 단기예보",
         "observedAt": observation["observed_at"],
         "temperature": observation.get("temperature"),
         "humidity": observation.get("humidity"),
@@ -966,9 +1318,19 @@ def region_weather(region_code: str):
         "condition": condition_by_precipitation.get(precipitation_type, "기상 정보"),
         "windSpeed": observation.get("wind_speed"),
         "precipitation1h": observation.get("precipitation_1h"),
+        # tg 수정 / 현재 시각 이후 최대 12시간의 단기 기온예보 데이터
+        "hourlyTemperatures": hourly_temperatures,
         "grid": {"nx": nx, "ny": ny},
         "isStale": is_stale,
-        "message": "최신 수집에 실패해 이전 저장값을 표시합니다." if is_stale else None,
+        "message": (
+            "최신 수집에 실패해 이전 저장값을 표시합니다."
+            if is_stale
+            else (
+                "현재 날씨는 정상이나 12시간 기온예보를 불러오지 못했습니다."
+                if forecast_failed
+                else None
+            )
+        ),
     }
 #------------------------------------------------------------------------------------------#
 
